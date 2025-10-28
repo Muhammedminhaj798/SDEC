@@ -22,10 +22,15 @@ const handleSubmit = async (e) => {
 
     // Example: store token or user info in localStorage
     localStorage.setItem("token", response.data.token);
+    console.log("wertyuio",response.data);
+    localStorage.setItem('isAdmin', response.data.isAdmin)
     alert("Login successful!");
-
-    // Optionally redirect to dashboard or home
+  if (response.data.isAdmin === false){
     router.push('/Payment/CheckoutPage')
+  }else{
+    router.push('/admin/adminCodeSettings')
+  }
+    // Optionally redirect to dashboard or home
 
   } catch (error) {
     console.error("Login failed:", error.response?.data || error.message);
