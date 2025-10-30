@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 'use client'
 import { useState, useEffect } from 'react';
 
@@ -8,14 +9,23 @@ const defaultMethods = {
 };
 
 export const usePaymentMethods = () => {
-  const [methods, setMethods] = useState(() => {
-    const saved = localStorage.getItem('paymentMethods');
-    return saved ? JSON.parse(saved) : defaultMethods;
-  });
+  const [methods, setMethods] = useState(defaultMethods);
 
   useEffect(() => {
-    localStorage.setItem('paymentMethods', JSON.stringify(methods));
-    window.dispatchEvent(new Event('paymentMethodsUpdated')); // trigger sync
+    // Only run this in browser
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('paymentMethods');
+      if (saved) {
+        setMethods(JSON.parse(saved));
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      localStorage.setItem('paymentMethods', JSON.stringify(methods));
+      window.dispatchEvent(new Event('paymentMethodsUpdated'));
+    }
   }, [methods]);
 
   const toggleMethod = (method) => {

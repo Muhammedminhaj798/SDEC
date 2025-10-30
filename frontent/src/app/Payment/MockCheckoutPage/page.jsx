@@ -1,41 +1,54 @@
 'use client';
 
-import React, { useState, useEffect } from 'react';
+import axios from 'axios';
+import React, { useState, useEffect, useCallback } from 'react';
 
 const RAZORPAY_SCRIPT = 'https://checkout.razorpay.com/v1/checkout.js';
 const RAZORPAY_TEST_KEY = 'rzp_test_1DP5mmOlF5G5ag'; // Test key
 
-// Mock Products
+// Mock Products – now with weight (kg)
 const MOCK_PRODUCTS = [
-  { id: 1, name: 'Wireless Headphones', price: 1299, quantity: 1 },
-  { id: 2, name: 'Phone Case', price: 499, quantity: 2 },
-  { id: 3, name: 'USB Cable', price: 299, quantity: 1 },
+  { id: 1, name: 'Wireless Headphones', price: 1299, quantity: 1, weight: 0.4 },
+  { id: 2, name: 'Phone Case',        price: 499,  quantity: 2, weight: 0.1 },
+  { id: 3, name: 'USB Cable',         price: 299,  quantity: 1, weight: 0.05 },
 ];
 
 export default function CODCheckout() {
+  // ────── Core state ──────
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState(false);
-  const [paymentMethod, setPaymentMethod] = useState('online'); // 'online' | 'cod'
+  const [paymentMethod, setPaymentMethod] = useState('online');
   const [order, setOrder] = useState(null);
   const [products] = useState(MOCK_PRODUCTS);
 
-  // Calculate total
-  const total = products.reduce((sum, p) => sum + p.price * p.quantity, 0);
+  // ────── Shipping state ──────
+  const [pincode, setPincode] = useState('');
+  const [shippingInfo, setShippingInfo] = useState(null); // Full shipping object
+  const [shippingLoading, setShippingLoading] = useState(false);
+  const [shippingError, setShippingError] = useState('');
 
-  // COD Advance: max(50, 10% of total)
-  const codAdvance = total * 0.1 > 50 ? total * 0.1 : 50;
-  const amountToPay = paymentMethod === 'cod' ? codAdvance : total;
+  // ────── Calculations ──────
+  const subTotal = products.reduce((sum, p) => sum + p.price * p.quantity, 0);
 
-  // Load saved order
+  // Total weight in kg – sent to backend
+  const totalWeightKg = products.reduce((sum, p) => sum + (p.weight || 0) * p.quantity, 0);
+
+  // Final shipping rate (0 if free)
+  const shippingRate = shippingInfo?.isFree ? 0 : (shippingInfo?.rate ?? 0);
+  const grandTotal = subTotal + shippingRate;
+
+  // COD Advance: max(50, 10% of grand total)
+  const codAdvance = grandTotal * 0.1 > 50 ? grandTotal * 0.1 : 50;
+  const amountToPay = paymentMethod === 'cod' ? codAdvance : grandTotal;
+
+  // ────── Load saved order ──────
   useEffect(() => {
     const saved = localStorage.getItem('codOrder');
-    if (saved) {
-      setOrder(JSON.parse(saved));
-    }
+    if (saved) setOrder(JSON.parse(saved));
   }, []);
 
-  // Load Razorpay
+  // ────── Load Razorpay ──────
   const loadRazorpay = () => {
     return new Promise((resolve) => {
       if (window.Razorpay) return resolve(true);
@@ -47,11 +60,72 @@ export default function CODCheckout() {
     });
   };
 
-  // Generate mock order ID
+  // ────── Generate mock order ID ──────
   const generateOrderId = () => `order_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
 
-  // Handle Payment (Advance or Full)
+  // ────── Shipping check – enhanced with weight & order value ──────
+  const checkShipping = useCallback(async (code) => {
+    // 1. Client-side validation: must be 6 digits
+    if (!code || code.length !== 6 || isNaN(code)) {
+      setShippingError('Please enter a valid 6-digit pincode.');
+      setShippingInfo(null);
+      return;
+    }
+
+    setShippingLoading(true);
+    setShippingError('');
+    setShippingInfo(null);
+
+    try {
+      // 2. Call your existing backend endpoint
+      //    Send: pincode, orderValue (subtotal), totalWeightKg
+      const res = await axios.post('http://localhost:9090/api/user/check', {
+        pincode: code.trim(),
+        orderValue: subTotal,
+        totalWeightKg,
+      });
+
+      const data = res.data;
+
+      // 3. Handle backend error response
+      if (!data.success) {
+        throw new Error(data.message || 'Invalid pincode');
+      }
+
+      // 4. Store full shipping info
+      setShippingInfo({
+        zone: data.zone,
+        rate: data.rate,
+        estimatedDays: data.estimatedDays,
+        isFree: data.isFree,
+        weightSurcharge: data.weightSurcharge || 0,
+      });
+    } catch (err) {
+      const msg =
+        err.response?.data?.message ||
+        err.message ||
+        'Failed to check shipping. Please try again.';
+      setShippingError(msg);
+    } finally {
+      setShippingLoading(false);
+    }
+  }, [subTotal, totalWeightKg]);
+
+  // ────── Debounce pincode input (runs after 600ms of inactivity) ──────
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      if (pincode.length === 6) checkShipping(pincode);
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [pincode, checkShipping]);
+
+  // ────── Handle Payment ──────
   const handlePayment = async () => {
+    if (!shippingInfo) {
+      setError('Please enter a valid pincode to calculate shipping.');
+      return;
+    }
+
     setLoading(true);
     setError('');
     setSuccess(false);
@@ -68,15 +142,19 @@ export default function CODCheckout() {
         currency: 'INR',
         name: 'Demo Store',
         description: paymentMethod === 'cod' ? 'COD Advance' : 'Full Payment',
-        // order_id removed to avoid 400 error
         handler: (response) => {
           const newOrder = {
             id: orderId,
             products,
-            totalAmount: total,
-            advanceAmount: paymentMethod === 'cod' ? amountToPay : total,
-            remainingAmount: paymentMethod === 'cod' ? total - amountToPay : 0,
+            subTotal,
+            totalWeightKg,
+            shippingRate,
+            grandTotal,
+            advanceAmount: paymentMethod === 'cod' ? amountToPay : grandTotal,
+            remainingAmount: paymentMethod === 'cod' ? grandTotal - amountToPay : 0,
             paymentMethod,
+            pincode,
+            shippingInfo,
             advancePaymentId: response.razorpay_payment_id,
             advancePaid: true,
             fullPaid: paymentMethod === 'online',
@@ -87,7 +165,6 @@ export default function CODCheckout() {
           localStorage.setItem('codOrder', JSON.stringify(newOrder));
           setOrder(newOrder);
           setSuccess(true);
-          setLoading(false);
         },
         prefill: { name: 'Test User', email: 'test@example.com', contact: '9999999999' },
         theme: { color: '#10b981' },
@@ -102,11 +179,12 @@ export default function CODCheckout() {
       rzp.open();
     } catch (err) {
       setError(err.message);
+    } finally {
       setLoading(false);
     }
   };
 
-  // Simulate Delivery Payment
+  // ────── Simulate Delivery Payment ──────
   const simulateDeliveryPayment = () => {
     if (!order || order.paymentMethod !== 'cod' || order.fullPaid) return;
 
@@ -128,6 +206,7 @@ export default function CODCheckout() {
     setSuccess(false);
   };
 
+  // ────── UI ──────
   return (
     <div className="min-h-screen bg-gray-50 py-8 px-4">
       <div className="max-w-3xl mx-auto space-y-6">
@@ -155,7 +234,7 @@ export default function CODCheckout() {
           </div>
         )}
 
-        {/* Error */}
+        {/* Global Error */}
         {error && (
           <div className="p-4 bg-red-50 border-2 border-red-200 rounded-lg flex items-center">
             <svg className="w-5 h-5 text-red-600 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -165,25 +244,134 @@ export default function CODCheckout() {
           </div>
         )}
 
-        {/* Order Summary */}
+        {/* ────── Pincode & Shipping Info ────── */}
+                {/* ────── Pincode & Shipping Info ────── */}
+        <div className="bg-white p-6 rounded-lg shadow">
+          <h2 className="text-xl font-semibold mb-4">Delivery Address</h2>
+
+          {/* ----- Pincode input ----- */}
+          <div className="flex flex-col space-y-2">
+            <label htmlFor="pincode" className="font-medium">Pincode</label>
+            <input
+              id="pincode"
+              type="text"
+              maxLength="6"
+              value={pincode}
+              onChange={(e) => setPincode(e.target.value.replace(/\D/g, ''))}
+              placeholder="Enter 6-digit pincode"
+              className="px-4 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500"
+            />
+          </div>
+
+          {/* ----- 1. Instant zone detection (frontend only) ----- */}
+          {pincode.length === 6 && !shippingLoading && !shippingError && (
+            <p className="mt-2 text-sm font-medium text-blue-700">
+              Your zone:{' '}
+              <span className="capitalize">
+                {(() => {
+                  const n = Number(pincode);
+                  // Sample Kerala pincodes (add more if you like)
+                  const kerala = [673001, 682001, 695001, 670001, 679121];
+                  if (kerala.includes(n)) return 'Kerala';
+                  if (String(n).length === 6) return 'Outside Kerala';
+                  return 'International';
+                })()}
+              </span>
+            </p>
+          )}
+
+          {/* ----- 2. Loading while we ask the backend ----- */}
+          {shippingLoading && (
+            <p className="mt-2 text-sm text-gray-600 flex items-center">
+              <svg className="animate-spin h-4 w-4 mr-1" viewBox="0 0 24 24">
+                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" className="opacity-25" />
+                <path fill="currentColor" d="M4 12a8 8 0 018-8v4h-4v4H4z" />
+              </svg>
+              Checking shipping…
+            </p>
+          )}
+
+          {/* ----- 3. Validation / backend error ----- */}
+          {shippingError && (
+            <p className="mt-2 text-sm text-red-600">{shippingError}</p>
+          )}
+
+          {/* ----- 4. Full shipping result (rate, ETA, free-shipping) ----- */}
+          {shippingInfo && (
+            <div className="mt-3 p-4 bg-green-50 border border-green-200 rounded-lg">
+              {shippingInfo.isFree ? (
+                <p className="text-lg font-bold text-green-700 flex items-center">
+                  Free shipping applied!
+                </p>
+              ) : (
+                <div className="space-y-1">
+                  <p className="font-medium text-green-800">
+                    Delivery to <span className="capitalize">{shippingInfo.zone}</span> Zone
+                  </p>
+                  <p className="text-xl font-bold text-green-700">
+                    ₹{shippingInfo.rate}
+                    {shippingInfo.weightSurcharge > 0 && (
+                      <span className="text-sm font-normal text-gray-600">
+                        {' '} (+₹{shippingInfo.weightSurcharge} weight)
+                      </span>
+                    )}
+                  </p>
+                  <p className="text-sm text-green-600">
+                    ETA: {shippingInfo.estimatedDays}{' '}
+                    {shippingInfo.estimatedDays === 1 ? 'day' : 'days'}
+                  </p>
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* ────── Order Summary ────── */}
         <div className="bg-white p-6 rounded-lg shadow">
           <h2 className="text-xl font-semibold mb-4">Order Summary</h2>
-          {products.map(p => (
+
+          {products.map((p) => (
             <div key={p.id} className="flex justify-between py-2 border-b">
               <div>
                 <p className="font-medium">{p.name}</p>
-                <p className="text-sm text-gray-500">Qty: {p.quantity}</p>
+                <p className="text-sm text-gray-500">Qty: {p.quantity} × {p.weight}kg</p>
               </div>
               <p>₹{(p.price * p.quantity).toFixed(2)}</p>
             </div>
           ))}
-          <div className="flex justify-between mt-4 pt-4 border-t-2 font-bold text-lg">
-            <span>Total</span>
-            <span>₹{total.toFixed(2)}</span>
+
+          <div className="mt-4 space-y-1 text-sm">
+            <div className="flex justify-between">
+              <span>Subtotal</span>
+              <span>₹{subTotal.toFixed(2)}</span>
+            </div>
+
+            <div className="flex justify-between">
+              <span>Shipping</span>
+              <span className={shippingInfo?.isFree ? 'text-green-600 font-medium' : ''}>
+                {shippingInfo
+                  ? shippingInfo.isFree
+                    ? 'FREE'
+                    : `₹${shippingRate.toFixed(2)}`
+                  : '—'}
+              </span>
+            </div>
+
+            {shippingInfo?.weightSurcharge > 0 && !shippingInfo?.isFree && (
+              <div className="flex justify-between text-xs text-gray-600">
+                <span className="pl-4">↳ Weight surcharge</span>
+                <span>₹{shippingInfo.weightSurcharge}</span>
+              </div>
+            )}
+
+            <div className="flex justify-between font-bold text-lg border-t pt-2">
+              <span>Grand Total</span>
+              <span>₹{grandTotal.toFixed(2)}</span>
+            </div>
           </div>
         </div>
 
-        {/* Payment Method */}
+        {/* ────── Payment Method ────── */}
         <div className="bg-white p-6 rounded-lg shadow">
           <h2 className="text-xl font-semibold mb-4">Payment Method</h2>
 
@@ -199,9 +387,9 @@ export default function CODCheckout() {
             />
             <div className="flex-1">
               <p className="font-medium">Pay Online (Full Payment)</p>
-              <p className="text-sm text-gray-600">Pay full ₹{total.toFixed(2)} now</p>
+              <p className="text-sm text-gray-600">Pay full ₹{grandTotal.toFixed(2)} now</p>
             </div>
-            <span className="font-bold text-green-600">₹{total.toFixed(2)}</span>
+            <span className="font-bold text-green-600">₹{grandTotal.toFixed(2)}</span>
           </label>
 
           {/* COD */}
@@ -234,19 +422,19 @@ export default function CODCheckout() {
             <p className="text-2xl font-bold text-blue-600">₹{amountToPay.toFixed(2)}</p>
             {paymentMethod === 'cod' && (
               <p className="text-sm text-blue-700">
-                ₹{(total - amountToPay).toFixed(2)} payable on delivery
+                ₹{(grandTotal - amountToPay).toFixed(2)} payable on delivery
               </p>
             )}
           </div>
         </div>
 
-        {/* Pay Button */}
+        {/* ────── Pay Button ────── */}
         {!order && (
           <button
             onClick={handlePayment}
-            disabled={loading}
+            disabled={loading || !shippingInfo}
             className={`w-full py-4 rounded-lg font-bold text-white flex items-center justify-center transition ${
-              loading ? 'bg-gray-400' : 'bg-green-600 hover:bg-green-700'
+              loading || !shippingInfo ? 'bg-gray-400 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700'
             }`}
           >
             {loading ? (
@@ -262,13 +450,15 @@ export default function CODCheckout() {
                 <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
                 </svg>
-                {paymentMethod === 'cod' ? `Pay ₹${amountToPay.toFixed(2)} Advance` : `Pay ₹${total.toFixed(2)} Now`}
+                {paymentMethod === 'cod'
+                  ? `Pay ₹${amountToPay.toFixed(2)} Advance`
+                  : `Pay ₹${grandTotal.toFixed(2)} Now`}
               </>
             )}
           </button>
         )}
 
-        {/* Simulate Delivery Payment */}
+        {/* ────── Simulate Delivery Payment ────── */}
         {order && order.paymentMethod === 'cod' && !order.fullPaid && (
           <button
             onClick={simulateDeliveryPayment}
@@ -281,7 +471,7 @@ export default function CODCheckout() {
           </button>
         )}
 
-        {/* Order Status */}
+        {/* ────── Order Status ────── */}
         {order && (
           <div className="bg-white p-6 rounded-lg shadow">
             <div className="flex justify-between items-center mb-4">
@@ -326,7 +516,7 @@ export default function CODCheckout() {
           </div>
         )}
 
-        {/* Test Instructions */}
+        {/* ────── Test Instructions ────── */}
         <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg text-xs">
           <strong className="block mb-1 text-amber-900">Test Mode Instructions</strong>
           <ul className="list-disc pl-5 space-y-1 text-amber-800">
