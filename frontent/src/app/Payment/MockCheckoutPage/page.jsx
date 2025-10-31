@@ -1,54 +1,61 @@
 'use client';
 
-import axios from 'axios';
-import React, { useState, useEffect, useCallback } from 'react';
+import { getShippingConfig } from '@/app/utils/getShippingConfig';
+import { useState, useEffect, useCallback } from 'react';
+// import { getShippingConfig } from '@/utils/getShippingConfig';
 
 const RAZORPAY_SCRIPT = 'https://checkout.razorpay.com/v1/checkout.js';
-const RAZORPAY_TEST_KEY = 'rzp_test_1DP5mmOlF5G5ag'; // Test key
+const RAZORPAY_KEY = 'rzp_test_1DP5mmOlF5G5ag';
 
-// Mock Products – now with weight (kg)
 const MOCK_PRODUCTS = [
-  { id: 1, name: 'Wireless Headphones', price: 1299, quantity: 1, weight: 0.4 },
-  { id: 2, name: 'Phone Case',        price: 499,  quantity: 2, weight: 0.1 },
-  { id: 3, name: 'USB Cable',         price: 299,  quantity: 1, weight: 0.05 },
+  { id: 1, name: 'Wireless Headphones', price: 1299, quantity: 1, weight: 0.4, image: '/headphones.jpg' },
+  { id: 2, name: 'Phone Case', price: 499, quantity: 2, weight: 0.1, image: '/case.jpg' },
+  { id: 3, name: 'USB Cable', price: 299, quantity: 1, weight: 0.05, image: '/cable.jpg' },
 ];
 
 export default function CODCheckout() {
-  // ────── Core state ──────
+  const [pincode, setPincode] = useState('');
+  const [shipping, setShipping] = useState(null);
+  const [shipLoad, setShipLoad] = useState(false);
+  const [shipErr, setShipErr] = useState('');
+  const [paymentMethod, setPaymentMethod] = useState('online');
+  const [order, setOrder] = useState(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState(false);
-  const [paymentMethod, setPaymentMethod] = useState('online');
-  const [order, setOrder] = useState(null);
-  const [products] = useState(MOCK_PRODUCTS);
 
-  // ────── Shipping state ──────
-  const [pincode, setPincode] = useState('');
-  const [shippingInfo, setShippingInfo] = useState(null); // Full shipping object
-  const [shippingLoading, setShippingLoading] = useState(false);
-  const [shippingError, setShippingError] = useState('');
+  // === NEW: Shipping Config from Admin ===
+  const [shippingConfig, setShippingConfig] = useState(getShippingConfig());
 
-  // ────── Calculations ──────
-  const subTotal = products.reduce((sum, p) => sum + p.price * p.quantity, 0);
+  const products = MOCK_PRODUCTS;
 
-  // Total weight in kg – sent to backend
-  const totalWeightKg = products.reduce((sum, p) => sum + (p.weight || 0) * p.quantity, 0);
-
-  // Final shipping rate (0 if free)
-  const shippingRate = shippingInfo?.isFree ? 0 : (shippingInfo?.rate ?? 0);
-  const grandTotal = subTotal + shippingRate;
-
-  // COD Advance: max(50, 10% of grand total)
-  const codAdvance = grandTotal * 0.1 > 50 ? grandTotal * 0.1 : 50;
+  // Calculations
+  const subTotal = products.reduce((s, p) => s + p.price * p.quantity, 0);
+  const totalWeightKg = products.reduce((s, p) => s + p.weight * p.quantity, 0);
+  const shippingCost = shipping?.totalShipping ?? 0;
+  const grandTotal = subTotal + shippingCost;
+  const codAdvance = Math.max(50, Math.round(grandTotal * 0.1));
   const amountToPay = paymentMethod === 'cod' ? codAdvance : grandTotal;
 
-  // ────── Load saved order ──────
+  // Load saved order
   useEffect(() => {
     const saved = localStorage.getItem('codOrder');
     if (saved) setOrder(JSON.parse(saved));
   }, []);
 
-  // ────── Load Razorpay ──────
+  // === LISTEN FOR ADMIN CONFIG UPDATES ===
+  useEffect(() => {
+    const handler = (e) => {
+      setShippingConfig(e.detail);
+      if (pincode.length === 6) {
+        fetchShipping(); // Recalculate instantly
+      }
+    };
+    window.addEventListener('shippingConfigUpdated', handler);
+    return () => window.removeEventListener('shippingConfigUpdated', handler);
+  }, [pincode]);
+
+  // Load Razorpay
   const loadRazorpay = () => {
     return new Promise((resolve) => {
       if (window.Razorpay) return resolve(true);
@@ -60,71 +67,78 @@ export default function CODCheckout() {
     });
   };
 
-  // ────── Generate mock order ID ──────
   const generateOrderId = () => `order_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`;
 
-  // ────── Shipping check – enhanced with weight & order value ──────
-  const checkShipping = useCallback(async (code) => {
-    // 1. Client-side validation: must be 6 digits
-    if (!code || code.length !== 6 || isNaN(code)) {
-      setShippingError('Please enter a valid 6-digit pincode.');
-      setShippingInfo(null);
+  // === UPDATED: Real-time Shipping using Admin Config ===
+  const fetchShipping = useCallback(() => {
+    if (!pincode || pincode.length !== 6 || isNaN(pincode)) {
+      setShipErr('Enter a valid 6-digit pincode.');
+      setShipping(null);
       return;
     }
 
-    setShippingLoading(true);
-    setShippingError('');
-    setShippingInfo(null);
+    setShipLoad(true);
+    setShipErr('');
 
     try {
-      // 2. Call your existing backend endpoint
-      //    Send: pincode, orderValue (subtotal), totalWeightKg
-      const res = await axios.post('http://localhost:9090/api/user/check', {
-        pincode: code.trim(),
-        orderValue: subTotal,
-        totalWeightKg,
-      });
+      // Determine zone
+      const zoneKey = pincode.startsWith("68") || pincode.startsWith("69")
+        ? "kerala"
+        : pincode.startsWith("9")
+        ? "international"
+        : "outside";
 
-      const data = res.data;
+      const zoneConfig = shippingConfig.zoneOverrides[zoneKey] || shippingConfig.zoneOverrides.outside;
+      const baseRate = zoneConfig.baseRate ?? shippingConfig.baseRate;
 
-      // 3. Handle backend error response
-      if (!data.success) {
-        throw new Error(data.message || 'Invalid pincode');
+      // Weight charge (first kg free)
+      const weightCharge = totalWeightKg > 1
+        ? shippingConfig.perKgRate * (totalWeightKg - 1)
+        : 0;
+
+      let totalShipping = baseRate + weightCharge;
+
+      // Free shipping logic
+      const freeApplies =
+        shippingConfig.freeShippingAppliesTo === "all" ||
+        (shippingConfig.freeShippingAppliesTo === "kerala" && zoneKey === "kerala");
+
+      const freeShipping = freeApplies && subTotal >= shippingConfig.freeShippingThreshold;
+
+      if (freeShipping) {
+        totalShipping = 0;
       }
 
-      // 4. Store full shipping info
-      setShippingInfo({
-        zone: data.zone,
-        rate: data.rate,
-        estimatedDays: data.estimatedDays,
-        isFree: data.isFree,
-        weightSurcharge: data.weightSurcharge || 0,
+      const estimatedDays = zoneKey === "kerala" ? 2 : zoneKey === "outside" ? 4 : 10;
+
+      setShipping({
+        zone: zoneKey === "kerala" ? "Kerala" : zoneKey === "outside" ? "Outside Kerala" : "International",
+        baseRate,
+        originalBase: baseRate,
+        weightCharge: Math.round(weightCharge),
+        totalShipping: Math.round(totalShipping),
+        freeShipping,
+        estimatedDays,
       });
     } catch (err) {
-      const msg =
-        err.response?.data?.message ||
-        err.message ||
-        'Failed to check shipping. Please try again.';
-      setShippingError(msg);
+      setShipErr(err.message);
+      setShipping(null);
     } finally {
-      setShippingLoading(false);
+      setShipLoad(false);
     }
-  }, [subTotal, totalWeightKg]);
+  }, [pincode, subTotal, totalWeightKg, shippingConfig]);
 
-  // ────── Debounce pincode input (runs after 600ms of inactivity) ──────
+  // Debounced pincode check
   useEffect(() => {
     const timer = setTimeout(() => {
-      if (pincode.length === 6) checkShipping(pincode);
+      if (pincode.length === 6) fetchShipping();
     }, 600);
     return () => clearTimeout(timer);
-  }, [pincode, checkShipping]);
+  }, [pincode, fetchShipping]);
 
-  // ────── Handle Payment ──────
+  // Payment Handler
   const handlePayment = async () => {
-    if (!shippingInfo) {
-      setError('Please enter a valid pincode to calculate shipping.');
-      return;
-    }
+    if (!shipping) return setError('Calculate shipping first.');
 
     setLoading(true);
     setError('');
@@ -137,45 +151,41 @@ export default function CODCheckout() {
       const orderId = generateOrderId();
 
       const options = {
-        key: RAZORPAY_TEST_KEY,
+        key: RAZORPAY_KEY,
         amount: Math.round(amountToPay * 100),
         currency: 'INR',
-        name: 'Demo Store',
+        name: 'MyStore',
         description: paymentMethod === 'cod' ? 'COD Advance' : 'Full Payment',
-        handler: (response) => {
+        handler: (res) => {
           const newOrder = {
             id: orderId,
             products,
             subTotal,
             totalWeightKg,
-            shippingRate,
+            shippingCost,
             grandTotal,
             advanceAmount: paymentMethod === 'cod' ? amountToPay : grandTotal,
             remainingAmount: paymentMethod === 'cod' ? grandTotal - amountToPay : 0,
             paymentMethod,
             pincode,
-            shippingInfo,
-            advancePaymentId: response.razorpay_payment_id,
+            shipping,
+            advancePaymentId: res.razorpay_payment_id,
             advancePaid: true,
             fullPaid: paymentMethod === 'online',
-            status: paymentMethod === 'cod' ? 'COD Confirmed' : 'Paid & Delivered',
+            status: paymentMethod === 'cod' ? 'COD - Advance Paid' : 'Paid & Delivered',
             timestamp: new Date().toISOString(),
           };
-
           localStorage.setItem('codOrder', JSON.stringify(newOrder));
           setOrder(newOrder);
           setSuccess(true);
         },
         prefill: { name: 'Test User', email: 'test@example.com', contact: '9999999999' },
         theme: { color: '#10b981' },
-        modal: { ondismiss: () => { setLoading(false); setError('Payment cancelled'); } },
+        modal: { ondismiss: () => setLoading(false) },
       };
 
       const rzp = new window.Razorpay(options);
-      rzp.on('payment.failed', (res) => {
-        setError(res.error.description || 'Payment failed');
-        setLoading(false);
-      });
+      rzp.on('payment.failed', () => setError('Payment failed'));
       rzp.open();
     } catch (err) {
       setError(err.message);
@@ -184,20 +194,17 @@ export default function CODCheckout() {
     }
   };
 
-  // ────── Simulate Delivery Payment ──────
   const simulateDeliveryPayment = () => {
     if (!order || order.paymentMethod !== 'cod' || order.fullPaid) return;
-
-    const updatedOrder = {
+    const updated = {
       ...order,
       fullPaid: true,
       remainingAmount: 0,
       status: 'Delivered & Fully Paid',
       deliveryPaymentTimestamp: new Date().toISOString(),
     };
-
-    localStorage.setItem('codOrder', JSON.stringify(updatedOrder));
-    setOrder(updatedOrder);
+    localStorage.setItem('codOrder', JSON.stringify(updated));
+    setOrder(updated);
   };
 
   const clearOrder = () => {
@@ -206,326 +213,217 @@ export default function CODCheckout() {
     setSuccess(false);
   };
 
-  // ────── UI ──────
   return (
     <div className="min-h-screen bg-gray-50 py-8 px-4">
-      <div className="max-w-3xl mx-auto space-y-6">
+      <div className="max-w-4xl mx-auto space-y-6">
 
         {/* Header */}
         <div className="text-center">
           <h1 className="text-3xl font-bold text-gray-900">Checkout</h1>
-          <p className="text-gray-600 mt-1">COD with Advance Payment Demo</p>
+          <p className="text-gray-600">Your items, shipping, and payment</p>
         </div>
 
         {/* Success */}
         {success && (
-          <div className="p-5 bg-green-50 border-2 border-green-200 rounded-lg flex items-center">
-            <svg className="w-6 h-6 text-green-600 mr-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-            </svg>
-            <div>
-              <p className="font-semibold text-green-900">
-                {paymentMethod === 'cod' ? 'Advance Paid!' : 'Payment Complete!'}
-              </p>
-              <p className="text-sm text-green-700">
-                {paymentMethod === 'cod' ? 'Your COD order is confirmed.' : 'Order delivered.'}
-              </p>
-            </div>
+          <div className="p-4 bg-green-50 border border-green-200 rounded-lg text-green-800 font-medium">
+            {paymentMethod === 'cod' ? 'Advance Paid! Remaining on delivery.' : 'Payment Complete!'}
           </div>
         )}
 
-        {/* Global Error */}
+        {/* Error */}
         {error && (
-          <div className="p-4 bg-red-50 border-2 border-red-200 rounded-lg flex items-center">
-            <svg className="w-5 h-5 text-red-600 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
-            </svg>
-            <p className="text-sm text-red-700">{error}</p>
+          <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
+            {error}
           </div>
         )}
 
-        {/* ────── Pincode & Shipping Info ────── */}
-                {/* ────── Pincode & Shipping Info ────── */}
-        <div className="bg-white p-6 rounded-lg shadow">
-          <h2 className="text-xl font-semibold mb-4">Delivery Address</h2>
-
-          {/* ----- Pincode input ----- */}
-          <div className="flex flex-col space-y-2">
-            <label htmlFor="pincode" className="font-medium">Pincode</label>
-            <input
-              id="pincode"
-              type="text"
-              maxLength="6"
-              value={pincode}
-              onChange={(e) => setPincode(e.target.value.replace(/\D/g, ''))}
-              placeholder="Enter 6-digit pincode"
-              className="px-4 py-2 border rounded-md focus:outline-none focus:ring-2 focus:ring-green-500"
-            />
-          </div>
-
-          {/* ----- 1. Instant zone detection (frontend only) ----- */}
-          {pincode.length === 6 && !shippingLoading && !shippingError && (
-            <p className="mt-2 text-sm font-medium text-blue-700">
-              Your zone:{' '}
-              <span className="capitalize">
-                {(() => {
-                  const n = Number(pincode);
-                  // Sample Kerala pincodes (add more if you like)
-                  const kerala = [673001, 682001, 695001, 670001, 679121];
-                  if (kerala.includes(n)) return 'Kerala';
-                  if (String(n).length === 6) return 'Outside Kerala';
-                  return 'International';
-                })()}
-              </span>
-            </p>
-          )}
-
-          {/* ----- 2. Loading while we ask the backend ----- */}
-          {shippingLoading && (
-            <p className="mt-2 text-sm text-gray-600 flex items-center">
-              <svg className="animate-spin h-4 w-4 mr-1" viewBox="0 0 24 24">
-                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" className="opacity-25" />
-                <path fill="currentColor" d="M4 12a8 8 0 018-8v4h-4v4H4z" />
-              </svg>
-              Checking shipping…
-            </p>
-          )}
-
-          {/* ----- 3. Validation / backend error ----- */}
-          {shippingError && (
-            <p className="mt-2 text-sm text-red-600">{shippingError}</p>
-          )}
-
-          {/* ----- 4. Full shipping result (rate, ETA, free-shipping) ----- */}
-          {shippingInfo && (
-            <div className="mt-3 p-4 bg-green-50 border border-green-200 rounded-lg">
-              {shippingInfo.isFree ? (
-                <p className="text-lg font-bold text-green-700 flex items-center">
-                  Free shipping applied!
-                </p>
-              ) : (
-                <div className="space-y-1">
-                  <p className="font-medium text-green-800">
-                    Delivery to <span className="capitalize">{shippingInfo.zone}</span> Zone
-                  </p>
-                  <p className="text-xl font-bold text-green-700">
-                    ₹{shippingInfo.rate}
-                    {shippingInfo.weightSurcharge > 0 && (
-                      <span className="text-sm font-normal text-gray-600">
-                        {' '} (+₹{shippingInfo.weightSurcharge} weight)
-                      </span>
-                    )}
-                  </p>
-                  <p className="text-sm text-green-600">
-                    ETA: {shippingInfo.estimatedDays}{' '}
-                    {shippingInfo.estimatedDays === 1 ? 'day' : 'days'}
-                  </p>
+        {/* PRODUCT LIST */}
+        <div className="bg-white p-6 rounded-xl shadow-md">
+          <h2 className="text-xl font-bold mb-4">Your Items</h2>
+          <div className="space-y-4">
+            {products.map((p) => (
+              <div key={p.id} className="flex items-center gap-4 p-4 border rounded-lg bg-gray-50">
+                <div className="w-16 h-16 bg-gray-200 border-2 border-dashed rounded-lg flex items-center justify-center">
+                  <span className="text-xs text-gray-500">IMG</span>
                 </div>
+                <div className="flex-1">
+                  <p className="font-semibold text-gray-900">{p.name}</p>
+                  <div className="text-xs text-gray-600 space-y-1 mt-1">
+                    <p>Quantity: <strong>{p.quantity}</strong></p>
+                    <p>Weight: <strong>{p.weight}kg each</strong> → <strong>{(p.weight * p.quantity).toFixed(2)}kg total</strong></p>
+                  </div>
+                </div>
+                <div className="text-right">
+                  <p className="text-sm text-gray-600">₹{p.price} × {p.quantity}</p>
+                  <p className="font-bold text-lg">₹{(p.price * p.quantity).toFixed(2)}</p>
+                </div>
+              </div>
+            ))}
+          </div>
+          <div className="mt-6 pt-4 border-t flex justify-between font-bold text-lg">
+            <span>Subtotal</span>
+            <span>₹{subTotal.toFixed(2)}</span>
+          </div>
+        </div>
+
+        {/* PINCODE & SHIPPING */}
+        <div className="bg-white p-6 rounded-xl shadow-md">
+          <label className="block font-medium mb-2 text-gray-700">Delivery Pincode</label>
+          <input
+            type="text"
+            value={pincode}
+            onChange={(e) => setPincode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+            placeholder="e.g. 682001"
+            className="w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-green-500 focus:border-transparent"
+          />
+
+          {shipLoad && (
+            <p className="mt-3 text-sm text-blue-600 flex items-center">
+              Calculating shipping...
+            </p>
+          )}
+
+          {shipErr && (
+            <p className="mt-3 text-sm text-red-600 bg-red-50 p-3 rounded-lg border border-red-200">
+              {shipErr}
+            </p>
+          )}
+
+          {/* SHIPPING RESULT */}
+          {shipping && !shipLoad && (
+            <div className="mt-5 p-5 bg-gradient-to-r from-blue-50 to-indigo-50 border-2 border-indigo-200 rounded-xl">
+              <div className="flex justify-between items-center mb-3">
+                <span className="font-semibold text-gray-700">Delivery Zone</span>
+                <span className={`px-4 py-1.5 rounded-full text-xs font-bold text-white ${
+                  shipping.zone === 'Kerala' ? 'bg-green-600' :
+                  shipping.zone === 'Outside Kerala' ? 'bg-orange-600' : 'bg-red-600'
+                }`}>
+                  {shipping.zone}
+                </span>
+              </div>
+
+              <div className="flex justify-between text-sm py-1">
+                <span>Base Shipping Rate</span>
+                <span className={shipping.freeShipping ? 'line-through text-gray-500' : 'font-medium'}>
+                  ₹{shipping.originalBase}
+                </span>
+              </div>
+
+              {shipping.freeShipping && (
+                <div className="flex items-center justify-between text-sm py-1 text-green-600 font-medium">
+                  <span>Free Shipping Applied</span>
+                  <span>-₹{shipping.originalBase}</span>
+                </div>
+              )}
+
+              {shipping.weightCharge > 0 && (
+                <div className="flex justify-between text-sm py-1 text-orange-600 font-medium">
+                  <span>Weight Surcharge ({totalWeightKg.toFixed(2)}kg)</span>
+                  <span>+₹{shipping.weightCharge}</span>
+                </div>
+              )}
+
+              <div className="flex justify-between font-bold text-lg pt-3 border-t border-gray-300 mt-2">
+                <span>Total Shipping Cost</span>
+                <span className={shipping.totalShipping === 0 ? 'text-green-600' : 'text-indigo-700'}>
+                  ₹{shipping.totalShipping}
+                </span>
+              </div>
+
+              <div className="text-center text-xs text-gray-600 mt-3">
+                Estimated Delivery: <strong>{shipping.estimatedDays} {shipping.estimatedDays === 1 ? 'day' : 'days'}</strong>
+              </div>
+
+              {shipping.zone === 'International' && (
+                <p className="text-center text-xs text-red-600 mt-2 font-medium">
+                  International delivery – higher rates apply.
+                </p>
               )}
             </div>
           )}
         </div>
 
-        {/* ────── Order Summary ────── */}
-        <div className="bg-white p-6 rounded-lg shadow">
-          <h2 className="text-xl font-semibold mb-4">Order Summary</h2>
-
-          {products.map((p) => (
-            <div key={p.id} className="flex justify-between py-2 border-b">
-              <div>
-                <p className="font-medium">{p.name}</p>
-                <p className="text-sm text-gray-500">Qty: {p.quantity} × {p.weight}kg</p>
-              </div>
-              <p>₹{(p.price * p.quantity).toFixed(2)}</p>
-            </div>
-          ))}
-
-          <div className="mt-4 space-y-1 text-sm">
-            <div className="flex justify-between">
-              <span>Subtotal</span>
-              <span>₹{subTotal.toFixed(2)}</span>
-            </div>
-
-            <div className="flex justify-between">
-              <span>Shipping</span>
-              <span className={shippingInfo?.isFree ? 'text-green-600 font-medium' : ''}>
-                {shippingInfo
-                  ? shippingInfo.isFree
-                    ? 'FREE'
-                    : `₹${shippingRate.toFixed(2)}`
-                  : '—'}
-              </span>
-            </div>
-
-            {shippingInfo?.weightSurcharge > 0 && !shippingInfo?.isFree && (
-              <div className="flex justify-between text-xs text-gray-600">
-                <span className="pl-4">↳ Weight surcharge</span>
-                <span>₹{shippingInfo.weightSurcharge}</span>
-              </div>
-            )}
-
-            <div className="flex justify-between font-bold text-lg border-t pt-2">
+        {/* ORDER SUMMARY */}
+        <div className="bg-white p-6 rounded-xl shadow-md">
+          <h2 className="font-bold mb-3">Order Summary</h2>
+          <div className="space-y-1 text-sm">
+            <div className="flex justify-between"><span>Items Total</span> <span>₹{subTotal}</span></div>
+            <div className="flex justify-between"><span>Shipping</span> <span>₹{shippingCost}</span></div>
+            <div className="flex justify-between font-bold text-xl border-t pt-3">
               <span>Grand Total</span>
               <span>₹{grandTotal.toFixed(2)}</span>
             </div>
           </div>
         </div>
 
-        {/* ────── Payment Method ────── */}
-        <div className="bg-white p-6 rounded-lg shadow">
-          <h2 className="text-xl font-semibold mb-4">Payment Method</h2>
+        {/* PAYMENT METHOD */}
+        <div className="bg-white p-6 rounded-xl shadow-md space-y-4">
+          <h2 className="font-bold">Payment Method</h2>
 
-          {/* Online */}
-          <label className="flex items-center p-4 border rounded-lg cursor-pointer hover:bg-gray-50 mb-3">
-            <input
-              type="radio"
-              name="method"
-              value="online"
-              checked={paymentMethod === 'online'}
-              onChange={(e) => setPaymentMethod(e.target.value)}
-              className="mr-3 h-5 w-5 text-green-600"
-            />
+          <label className="flex items-center p-4 border rounded-lg cursor-pointer hover:bg-gray-50">
+            <input type="radio" name="pay" value="online" checked={paymentMethod === 'online'} onChange={(e) => setPaymentMethod(e.target.value)} className="mr-3 h-5 w-5 text-green-600" />
             <div className="flex-1">
-              <p className="font-medium">Pay Online (Full Payment)</p>
-              <p className="text-sm text-gray-600">Pay full ₹{grandTotal.toFixed(2)} now</p>
+              <p className="font-medium">Pay Online</p>
+              <p className="text-sm text-gray-600">Pay ₹{grandTotal.toFixed(2)} now</p>
             </div>
             <span className="font-bold text-green-600">₹{grandTotal.toFixed(2)}</span>
           </label>
 
-          {/* COD */}
           <label className="flex items-center p-4 border rounded-lg cursor-pointer hover:bg-gray-50">
-            <input
-              type="radio"
-              name="method"
-              value="cod"
-              checked={paymentMethod === 'cod'}
-              onChange={(e) => setPaymentMethod(e.target.value)}
-              className="mr-3 h-5 w-5 text-orange-600"
-            />
+            <input type="radio" name="pay" value="cod" checked={paymentMethod === 'cod'} onChange={(e) => setPaymentMethod(e.target.value)} className="mr-3 h-5 w-5 text-orange-600" />
             <div className="flex-1">
-              <p className="font-medium">Cash on Delivery (COD with Advance)</p>
-              <p className="text-sm text-gray-600">
-                Pay <strong>₹{codAdvance.toFixed(2)}</strong> advance
-              </p>
-              {paymentMethod === 'cod' && (
-                <p className="text-xs text-orange-700 mt-2">
-                  Pay advance to confirm your COD order.
-                </p>
-              )}
+              <p className="font-medium">Cash on Delivery</p>
+              <p className="text-sm text-gray-600">Pay ₹{codAdvance.toFixed(2)} advance</p>
             </div>
             <span className="font-bold text-orange-600">₹{codAdvance.toFixed(2)}</span>
           </label>
 
-          {/* Pay Now Amount */}
-          <div className="mt-5 p-4 bg-blue-50 rounded-lg">
+          <div className="p-4 bg-blue-50 rounded-lg text-center">
             <p className="font-medium text-blue-900">Pay Now:</p>
             <p className="text-2xl font-bold text-blue-600">₹{amountToPay.toFixed(2)}</p>
             {paymentMethod === 'cod' && (
-              <p className="text-sm text-blue-700">
-                ₹{(grandTotal - amountToPay).toFixed(2)} payable on delivery
+              <p className="text-sm text-blue-700 mt-1">
+                ₹{(grandTotal - amountToPay).toFixed(2)} on delivery
               </p>
             )}
           </div>
         </div>
 
-        {/* ────── Pay Button ────── */}
+        {/* PAY BUTTON */}
         {!order && (
           <button
             onClick={handlePayment}
-            disabled={loading || !shippingInfo}
-            className={`w-full py-4 rounded-lg font-bold text-white flex items-center justify-center transition ${
-              loading || !shippingInfo ? 'bg-gray-400 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700'
+            disabled={loading || shipLoad || !shipping}
+            className={`w-full py-4 rounded-lg font-bold text-white transition flex items-center justify-center ${
+              loading || !shipping ? 'bg-gray-400 cursor-not-allowed' : 'bg-green-600 hover:bg-green-700'
             }`}
           >
-            {loading ? (
-              <>
-                <svg className="animate-spin mr-3 h-5 w-5" viewBox="0 0 24 24">
-                  <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" fill="none" className="opacity-25" />
-                  <path fill="currentColor" d="M4 12a8 8 0 018-8v4h-4v4H4z" />
-                </svg>
-                Processing...
-              </>
-            ) : (
-              <>
-                <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
-                </svg>
-                {paymentMethod === 'cod'
-                  ? `Pay ₹${amountToPay.toFixed(2)} Advance`
-                  : `Pay ₹${grandTotal.toFixed(2)} Now`}
-              </>
-            )}
+            {loading ? 'Processing...' : paymentMethod === 'cod' ? `Pay ₹${amountToPay.toFixed(2)} Advance` : `Pay ₹${grandTotal.toFixed(2)} Now`}
           </button>
         )}
 
-        {/* ────── Simulate Delivery Payment ────── */}
-        {order && order.paymentMethod === 'cod' && !order.fullPaid && (
-          <button
-            onClick={simulateDeliveryPayment}
-            className="w-full py-4 bg-orange-600 hover:bg-orange-700 text-white font-bold rounded-lg flex items-center justify-center"
-          >
-            <svg className="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
-            </svg>
+        {/* SIMULATE DELIVERY */}
+        {order?.paymentMethod === 'cod' && !order.fullPaid && (
+          <button onClick={simulateDeliveryPayment} className="w-full py-4 bg-orange-600 hover:bg-orange-700 text-white font-bold rounded-lg">
             Simulate Delivery Payment (₹{order.remainingAmount.toFixed(2)})
           </button>
         )}
 
-        {/* ────── Order Status ────── */}
+        {/* ORDER STATUS */}
         {order && (
-          <div className="bg-white p-6 rounded-lg shadow">
+          <div className="bg-white p-6 rounded-xl shadow-md">
             <div className="flex justify-between items-center mb-4">
-              <h2 className="text-xl font-semibold">Order Status</h2>
-              <button onClick={clearOrder} className="text-sm text-red-600 hover:underline">
-                Clear Order
-              </button>
+              <h2 className="font-bold">Order Status</h2>
+              <button onClick={clearOrder} className="text-sm text-red-600 hover:underline">Clear</button>
             </div>
-
-            <div className="space-y-3 text-sm">
-              <div className="flex justify-between">
-                <span className="text-gray-600">Order ID</span>
-                <code className="font-mono">{order.id}</code>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-600">Status</span>
-                <span className={`font-bold ${order.status.includes('Delivered') ? 'text-green-600' : 'text-orange-600'}`}>
-                  {order.status}
-                </span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-600">Advance Paid</span>
-                <span className="font-medium">₹{order.advanceAmount.toFixed(2)}</span>
-              </div>
-              <div className="flex justify-between">
-                <span className="text-gray-600">Remaining</span>
-                <span className={order.remainingAmount > 0 ? 'text-orange-600' : 'text-green-600'}>
-                  ₹{order.remainingAmount.toFixed(2)}
-                </span>
-              </div>
-              <div className="flex justify-between text-xs text-gray-500">
-                <span>Placed</span>
-                <span>{new Date(order.timestamp).toLocaleString()}</span>
-              </div>
-              {order.deliveryPaymentTimestamp && (
-                <div className="flex justify-between text-xs text-green-600">
-                  <span>Delivered & Paid</span>
-                  <span>{new Date(order.deliveryPaymentTimestamp).toLocaleString()}</span>
-                </div>
-              )}
+            <div className="text-sm space-y-2">
+              <div className="flex justify-between"><span>ID</span> <code>{order.id}</code></div>
+              <div className="flex justify-between"><span>Status</span> <span className="font-bold text-green-600">{order.status}</span></div>
+              <div className="flex justify-between"><span>Advance</span> ₹{order.advanceAmount.toFixed(2)}</div>
+              <div className="flex justify-between"><span>Remaining</span> <span className={order.remainingAmount > 0 ? 'text-orange-600' : 'text-green-600'}>₹{order.remainingAmount.toFixed(2)}</span></div>
             </div>
           </div>
         )}
-
-        {/* ────── Test Instructions ────── */}
-        <div className="p-4 bg-amber-50 border border-amber-200 rounded-lg text-xs">
-          <strong className="block mb-1 text-amber-900">Test Mode Instructions</strong>
-          <ul className="list-disc pl-5 space-y-1 text-amber-800">
-            <li>Use card: <code>4111 1111 1111 1111</code> + any future date & CVV</li>
-            <li>UPI: <code>success@razorpay</code> (success) | <code>failure@razorpay</code> (fail)</li>
-            <li>Order saved in <code>localStorage</code></li>
-          </ul>
-        </div>
-
       </div>
     </div>
   );

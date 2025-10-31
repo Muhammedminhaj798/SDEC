@@ -8,7 +8,7 @@ const navigationItems = [
   { name: 'Dashboard', href: '/admin/Dashboard', icon: Home },
   { name: 'COD Settings', href: '/admin/adminCodeSettings', icon: Package },
   { name: 'Payment Settings', href: '/admin/adminPaymentMethod', icon: CreditCard },
-  { name: 'Advanced Settings', href: '/admin/advanced-settings', icon: Settings },
+  { name: 'Shipping', href: '/admin/adminShipping', icon: Settings },
 ];
 
 export default function AdminLayout({ children }) {

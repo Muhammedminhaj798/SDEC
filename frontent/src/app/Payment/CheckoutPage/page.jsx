@@ -1,6 +1,5 @@
-
-import MockCheckout from "../MockCheckoutPage/page";
+import CODCheckout from "../MockCheckoutPage/page";
 
 export default function Checkout() {
-  return <MockCheckout />;
+  return <CODCheckout />;
 }
