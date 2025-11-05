@@ -175,7 +175,7 @@ const AdminCodSettings = () => {
         <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
           <button className="w-full flex items-center justify-center py-3 px-6 bg-gradient-to-r from-blue-600 to-indigo-600 text-white font-semibold rounded-lg hover:from-blue-700 hover:to-indigo-700 focus:outline-none focus:ring-4 focus:ring-blue-300 transition-all shadow-md hover:shadow-lg">
             <Save className="w-5 h-5 mr-2" />
-            Settings Saved
+            Settings Saved 
           </button>
           <p className="text-center text-xs text-gray-500 mt-3">
             Changes are automatically synced across all channels
